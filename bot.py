@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -461,6 +462,7 @@ async def photo_enhance_menu(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
         PHOTO_ENHANCE_MENU,
         reply_markup=_kb_tools(PHOTO_ENHANCE_TOOLS, "tool:photo_enhance", "nav:photo"),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -470,6 +472,7 @@ async def photo_modify_menu(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
         PHOTO_MODIFY_MENU,
         reply_markup=_kb_tools(PHOTO_MODIFY_TOOLS, "tool:photo_modify", "nav:photo"),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -499,6 +502,7 @@ async def video_upscale_menu(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
         VIDEO_UPSCALE_MENU,
         reply_markup=_kb_tools(VIDEO_GENERATORS, "tool:video_upscale", "nav:video"),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -600,7 +604,11 @@ async def on_task(message: Message, state: FSMContext) -> None:
     title, price = TOOL_BY_ID[tool_id]
     ok, balance = try_charge(message.from_user.id, price)
     if not ok:
-        await message.answer(low_balance_text(message.from_user.id), reply_markup=kb_pay())
+        await message.answer(
+            low_balance_text(message.from_user.id),
+            reply_markup=kb_pay(),
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     await message.answer(
@@ -622,7 +630,11 @@ async def on_task_without_tool(message: Message) -> None:
     if tool_id:
         return  # handled by waiting_task state
     if balance <= 0:
-        await message.answer(low_balance_text(message.from_user.id), reply_markup=kb_pay())
+        await message.answer(
+            low_balance_text(message.from_user.id),
+            reply_markup=kb_pay(),
+            parse_mode=ParseMode.HTML,
+        )
         return
     await message.answer("Выберите функцию в меню 👇", reply_markup=kb_main_menu())
 
@@ -631,7 +643,10 @@ async def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Set BOT_TOKEN env variable")
 
-    bot = Bot(token=BOT_TOKEN)
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
