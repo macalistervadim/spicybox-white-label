@@ -8,7 +8,6 @@ Run:
 
 Optional env:
   STARS_PER_USD=50   — how many Telegram Stars equal $1 on balance
-  DB_PATH=spark.db
 """
 
 from __future__ import annotations
@@ -16,8 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import sqlite3
-from contextlib import closing
+from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -44,15 +42,8 @@ logger = logging.getLogger("spark")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 STARS_PER_USD = int(os.environ.get("STARS_PER_USD", "50"))
-DB_PATH = os.environ.get("DB_PATH", "spark.db")
 
 # ── KP texts ────────────────────────────────────────────────────────────────
-
-RULES_TEXT = (
-    "Spark AI Creator — a top-tier AI bot for creating, enhancing, and editing "
-    "images and videos — everything you need in one place!\n\n"
-    "🚀 Hit Start and you won't need any other bots!"
-)
 
 WELCOME_TEXT = (
     "<b>👋 Welcome!</b> Thanks for stopping by!\n\n"
@@ -216,101 +207,58 @@ for _id, _title, _price in (
     TOOL_BY_ID[_id] = (_title, _price)
 
 
-# ── SQLite persistence ───────────────────────────────────────────────────────
+# ── In-memory user state (resets on bot restart) ─────────────────────────────
 
-def init_db() -> None:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                accepted_rules INTEGER NOT NULL DEFAULT 0,
-                balance_usd TEXT NOT NULL DEFAULT '0.00',
-                active_tool_id TEXT,
-                active_mode TEXT
-            )
-            """
-        )
-        conn.commit()
+@dataclass
+class UserState:
+    balance_usd: Decimal = field(default_factory=lambda: Decimal("0.00"))
+    active_tool_id: str | None = None
+    active_mode: str | None = None
 
 
-def _ensure_user(user_id: int) -> None:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-        conn.commit()
+_users: dict[int, UserState] = {}
 
 
-def _get_user(user_id: int) -> tuple[bool, Decimal, str | None, str | None]:
-    _ensure_user(user_id)
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        row = conn.execute(
-            "SELECT accepted_rules, balance_usd, active_tool_id, active_mode "
-            "FROM users WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-    assert row is not None
-    return bool(row[0]), Decimal(row[1]), row[2], row[3]
+def _user(user_id: int) -> UserState:
+    if user_id not in _users:
+        _users[user_id] = UserState()
+    return _users[user_id]
 
 
-def set_accepted_rules(user_id: int) -> None:
-    _ensure_user(user_id)
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute(
-            "UPDATE users SET accepted_rules = 1 WHERE user_id = ?",
-            (user_id,),
-        )
-        conn.commit()
+def _get_user(user_id: int) -> tuple[Decimal, str | None, str | None]:
+    u = _user(user_id)
+    return u.balance_usd, u.active_tool_id, u.active_mode
 
 
 def set_active_tool(user_id: int, tool_id: str, mode: str) -> None:
-    _ensure_user(user_id)
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute(
-            "UPDATE users SET active_tool_id = ?, active_mode = ? WHERE user_id = ?",
-            (tool_id, mode, user_id),
-        )
-        conn.commit()
+    u = _user(user_id)
+    u.active_tool_id = tool_id
+    u.active_mode = mode
 
 
 def clear_active_tool(user_id: int) -> None:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute(
-            "UPDATE users SET active_tool_id = NULL, active_mode = NULL WHERE user_id = ?",
-            (user_id,),
-        )
-        conn.commit()
+    u = _users.get(user_id)
+    if u is not None:
+        u.active_tool_id = None
+        u.active_mode = None
 
 
 def add_balance(user_id: int, usd: Decimal) -> Decimal:
-    _ensure_user(user_id)
-    _, balance, _, _ = _get_user(user_id)
-    new_balance = (balance + usd).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute(
-            "UPDATE users SET balance_usd = ? WHERE user_id = ?",
-            (str(new_balance), user_id),
-        )
-        conn.commit()
-    return new_balance
+    u = _user(user_id)
+    u.balance_usd = (u.balance_usd + usd).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return u.balance_usd
 
 
 def try_charge(user_id: int, price: Decimal) -> tuple[bool, Decimal]:
-    _ensure_user(user_id)
-    _, balance, _, _ = _get_user(user_id)
-    if balance < price:
-        return False, balance
-    new_balance = (balance - price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute(
-            "UPDATE users SET balance_usd = ? WHERE user_id = ?",
-            (str(new_balance), user_id),
-        )
-        conn.commit()
-    return True, new_balance
+    u = _user(user_id)
+    if u.balance_usd < price:
+        return False, u.balance_usd
+    u.balance_usd = (u.balance_usd - price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return True, u.balance_usd
 
 
 def format_balance(user_id: int) -> str:
-    _, balance, _, _ = _get_user(user_id)
+    balance, _, _ = _get_user(user_id)
     return f"{balance:.2f}"
 
 
@@ -340,12 +288,6 @@ async def send_topup_invoice(bot: Bot, user_id: int, usd: int) -> None:
 
 
 # ── Keyboards ───────────────────────────────────────────────────────────────
-
-def kb_rules() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="✅ I confirm", callback_data="rules:accept")]]
-    )
-
 
 def kb_main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -422,19 +364,7 @@ async def show_main_menu(target: Message, *, edit: bool = False) -> None:
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    accepted, _, _, _ = _get_user(message.from_user.id)
-    if not accepted:
-        await message.answer(RULES_TEXT, reply_markup=kb_rules())
-        return
     await show_main_menu(message)
-
-
-@router.callback_query(F.data == "rules:accept")
-async def on_rules_accept(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    set_accepted_rules(callback.from_user.id)
-    await state.clear()
-    await show_main_menu(callback.message, edit=True)
 
 
 @router.callback_query(F.data == "nav:main")
@@ -625,7 +555,7 @@ def _is_task_message(message: Message) -> bool:
 
 @router.message(SparkStates.waiting_task, _is_task_message)
 async def on_task(message: Message, state: FSMContext) -> None:
-    _, _, tool_id, _ = _get_user(message.from_user.id)
+    _, tool_id, _ = _get_user(message.from_user.id)
     if not tool_id or tool_id not in TOOL_BY_ID:
         await state.clear()
         await message.answer("Please select a tool from the menu first.", reply_markup=kb_main_menu())
@@ -653,10 +583,7 @@ async def on_task(message: Message, state: FSMContext) -> None:
 @router.message(_is_task_message)
 async def on_task_without_tool(message: Message) -> None:
     """KP: any task without active tool / zero balance → balance prompt."""
-    accepted, balance, tool_id, _ = _get_user(message.from_user.id)
-    if not accepted:
-        await message.answer(RULES_TEXT, reply_markup=kb_rules())
-        return
+    balance, tool_id, _ = _get_user(message.from_user.id)
     if tool_id:
         return  # handled by waiting_task state
     if balance <= 0:
@@ -673,7 +600,6 @@ async def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Set BOT_TOKEN env variable")
 
-    init_db()
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -681,7 +607,7 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    logger.info("Spark AI Creator bot starting (STARS_PER_USD=%s, DB_PATH=%s)", STARS_PER_USD, DB_PATH)
+    logger.info("Spark AI Creator bot starting (STARS_PER_USD=%s)", STARS_PER_USD)
     await dp.start_polling(bot)
 
 
