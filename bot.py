@@ -8,6 +8,7 @@ Run:
 
 Optional env:
   STARS_PER_USD=50   — how many Telegram Stars equal $1 on balance
+  DB_PATH=spark.db
 """
 
 from __future__ import annotations
@@ -15,7 +16,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from dataclasses import dataclass, field
+import sqlite3
+from contextlib import closing
 from decimal import Decimal, ROUND_HALF_UP
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -42,6 +44,7 @@ logger = logging.getLogger("spark")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 STARS_PER_USD = int(os.environ.get("STARS_PER_USD", "50"))
+DB_PATH = os.environ.get("DB_PATH", "spark.db")
 
 # ── KP texts ────────────────────────────────────────────────────────────────
 
@@ -213,59 +216,97 @@ for _id, _title, _price in (
     TOOL_BY_ID[_id] = (_title, _price)
 
 
-# ── In-memory user state (resets on bot restart) ─────────────────────────────
+# ── SQLite persistence ───────────────────────────────────────────────────────
 
-@dataclass
-class UserState:
-    accepted_rules: bool = False
-    balance_usd: Decimal = field(default_factory=lambda: Decimal("0.00"))
-    active_tool_id: str | None = None
-    active_mode: str | None = None
+def init_db() -> None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                accepted_rules INTEGER NOT NULL DEFAULT 0,
+                balance_usd TEXT NOT NULL DEFAULT '0.00',
+                active_tool_id TEXT,
+                active_mode TEXT
+            )
+            """
+        )
+        conn.commit()
 
 
-_users: dict[int, UserState] = {}
-
-
-def _user(user_id: int) -> UserState:
-    if user_id not in _users:
-        _users[user_id] = UserState()
-    return _users[user_id]
+def _ensure_user(user_id: int) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        conn.commit()
 
 
 def _get_user(user_id: int) -> tuple[bool, Decimal, str | None, str | None]:
-    u = _user(user_id)
-    return u.accepted_rules, u.balance_usd, u.active_tool_id, u.active_mode
+    _ensure_user(user_id)
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = conn.execute(
+            "SELECT accepted_rules, balance_usd, active_tool_id, active_mode "
+            "FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    assert row is not None
+    return bool(row[0]), Decimal(row[1]), row[2], row[3]
 
 
 def set_accepted_rules(user_id: int) -> None:
-    _user(user_id).accepted_rules = True
+    _ensure_user(user_id)
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "UPDATE users SET accepted_rules = 1 WHERE user_id = ?",
+            (user_id,),
+        )
+        conn.commit()
 
 
 def set_active_tool(user_id: int, tool_id: str, mode: str) -> None:
-    u = _user(user_id)
-    u.active_tool_id = tool_id
-    u.active_mode = mode
+    _ensure_user(user_id)
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "UPDATE users SET active_tool_id = ?, active_mode = ? WHERE user_id = ?",
+            (tool_id, mode, user_id),
+        )
+        conn.commit()
 
 
 def clear_active_tool(user_id: int) -> None:
-    u = _users.get(user_id)
-    if u is not None:
-        u.active_tool_id = None
-        u.active_mode = None
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "UPDATE users SET active_tool_id = NULL, active_mode = NULL WHERE user_id = ?",
+            (user_id,),
+        )
+        conn.commit()
 
 
 def add_balance(user_id: int, usd: Decimal) -> Decimal:
-    u = _user(user_id)
-    u.balance_usd = (u.balance_usd + usd).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    return u.balance_usd
+    _ensure_user(user_id)
+    _, balance, _, _ = _get_user(user_id)
+    new_balance = (balance + usd).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "UPDATE users SET balance_usd = ? WHERE user_id = ?",
+            (str(new_balance), user_id),
+        )
+        conn.commit()
+    return new_balance
 
 
 def try_charge(user_id: int, price: Decimal) -> tuple[bool, Decimal]:
-    u = _user(user_id)
-    if u.balance_usd < price:
-        return False, u.balance_usd
-    u.balance_usd = (u.balance_usd - price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    return True, u.balance_usd
+    _ensure_user(user_id)
+    _, balance, _, _ = _get_user(user_id)
+    if balance < price:
+        return False, balance
+    new_balance = (balance - price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "UPDATE users SET balance_usd = ? WHERE user_id = ?",
+            (str(new_balance), user_id),
+        )
+        conn.commit()
+    return True, new_balance
 
 
 def format_balance(user_id: int) -> str:
@@ -311,7 +352,6 @@ def kb_main_menu() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="📸 Photos & Images", callback_data="nav:photo")],
             [InlineKeyboardButton(text="🎬 Video Creation", callback_data="nav:video")],
-            [InlineKeyboardButton(text="💳 Top Up Balance", callback_data="nav:pay")],
         ]
     )
 
@@ -370,12 +410,11 @@ router = Router()
 
 
 async def show_main_menu(target: Message, *, edit: bool = False) -> None:
-    text = WELCOME_TEXT + f"\n\n💰 Balance: <b>${format_balance(target.from_user.id)}</b>"
     markup = kb_main_menu()
     if edit and target.from_user:
-        await target.edit_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+        await target.edit_text(WELCOME_TEXT, reply_markup=markup, parse_mode=ParseMode.HTML)
     else:
-        await target.answer(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+        await target.answer(WELCOME_TEXT, reply_markup=markup, parse_mode=ParseMode.HTML)
 
 
 # ── Handlers ────────────────────────────────────────────────────────────────
@@ -403,8 +442,11 @@ async def nav_main(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.clear()
     clear_active_tool(callback.from_user.id)
-    text = WELCOME_TEXT + f"\n\n💰 Balance: <b>${format_balance(callback.from_user.id)}</b>"
-    await callback.message.edit_text(text, reply_markup=kb_main_menu(), parse_mode=ParseMode.HTML)
+    await callback.message.edit_text(
+        WELCOME_TEXT,
+        reply_markup=kb_main_menu(),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @router.callback_query(F.data == "nav:photo")
@@ -631,6 +673,7 @@ async def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Set BOT_TOKEN env variable")
 
+    init_db()
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -638,7 +681,7 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    logger.info("Spark AI Creator bot starting (STARS_PER_USD=%s)", STARS_PER_USD)
+    logger.info("Spark AI Creator bot starting (STARS_PER_USD=%s, DB_PATH=%s)", STARS_PER_USD, DB_PATH)
     await dp.start_polling(bot)
 
 

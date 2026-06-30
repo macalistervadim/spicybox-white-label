@@ -168,6 +168,7 @@ cython_debug/
 .idea/
 .cursor/
 bots.db
+spark.db
 join_requests/
 users.json
 localenvrc
